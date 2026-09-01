@@ -3,6 +3,9 @@
 venv/
 env/
 
+data/
+artifacts/
+
 # Ignore compiled Python files
 __pycache__/
 *.pyc

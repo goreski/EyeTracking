@@ -6,6 +6,48 @@ from mediapipe.python.solutions import face_mesh as mp_face_mesh
 from mediapipe.python.solutions import drawing_utils as mp_drawing
 from typing import Any
 
+# Full eye-contour landmark indices (denser than the 6-point EAR set).
+LEFT_EYE_INDICES = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466,
+                     388, 387, 386, 385, 384, 398]
+RIGHT_EYE_INDICES = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173,
+                      157, 158, 159, 160, 161, 246]
+
+
+def crop_eye_region(frame, landmarks, eye_indices, padding=8):
+    """
+    Crops the eye bounding box (plus padding) out of the frame.
+
+    `landmarks` are MediaPipe's normalized (0-1) landmark objects, not the
+    [x, y, z] lists produced by extract_raw_features.
+
+    Returns (crop, local_points) where local_points are the eye-contour
+    pixel coordinates translated into the crop's own coordinate space, or
+    (None, None) if the box is degenerate.
+    """
+    h, w = frame.shape[:2]
+    points = np.array(
+        [(landmarks[i].x * w, landmarks[i].y * h) for i in eye_indices],
+        dtype=np.int32,
+    )
+
+    x_min, y_min = points.min(axis=0)
+    x_max, y_max = points.max(axis=0)
+
+    x_min = max(int(x_min) - padding, 0)
+    y_min = max(int(y_min) - padding, 0)
+    x_max = min(int(x_max) + padding, w)
+    y_max = min(int(y_max) + padding, h)
+
+    # Degenerate box (e.g. landmarks collapsed) yields an empty crop.
+    if x_max <= x_min or y_max <= y_min:
+        return None, None
+
+    # Copy so later drawing on `frame` (e.g. the mesh overlay) can't leak into the crop.
+    crop = frame[y_min:y_max, x_min:x_max].copy()
+    local_points = points - np.array([x_min, y_min])
+
+    return crop, local_points
+
 
 def euclidean_distance(point_a, point_b):
     """
