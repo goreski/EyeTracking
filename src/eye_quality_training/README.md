@@ -40,6 +40,28 @@ Collect diverse people, camera mounts, lighting, glasses, and partial
 occlusions. Do not save many near-identical adjacent frames: vary the pose and
 conditions between samples.
 
+### Paired ground truth for cross-eye correlation
+
+Press `Z` to freeze the current frame, then label each eye independently
+(e.g. one closed, one open) before pressing `Z` again to resume. Because both
+patches come from the exact same frozen instant, this records genuine
+ground truth for how often the two eyes share the same open/closed
+state -- including deliberately asymmetric cases a live, moving feed can't
+reliably capture. Every save (frozen or not) is also logged to
+`pairs_manifest.csv` in the output directory.
+
+Once you have a reasonable number of frozen pairs (20+), fit the
+correlation used by `src/eye_pair_fusion.py` to infer an occluded eye's
+state from the other eye:
+
+```powershell
+python src\eye_quality_training\estimate_pair_correlation.py
+```
+
+This writes `artifacts/eye_quality/eye_pair_correlation.json`. Until that
+file exists, the fusion module falls back to a documented default
+assumption (0.93) instead of a measured value.
+
 ## Split, train, and export
 
 Install the standalone training dependencies into a separate environment:

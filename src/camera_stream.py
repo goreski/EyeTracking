@@ -17,6 +17,7 @@ from detector import (
     RIGHT_EYE_INDICES,
 )
 from models.eye_quality import EyeQualityModel
+from eye_pair_fusion import fuse_eye_pair
 from state_monitor import DriverStateMonitor
 
 from metrics import (
@@ -44,7 +45,7 @@ EYE_THUMB_MARGIN = 10
 SHOW_EYE_LANDMARKS = False  # Toggle to draw eye-contour landmarks in the thumbnails
 
 
-def overlay_eye_thumbnail(frame, eye_crop, eye_points, quality_result, x, y, eye_name):
+def overlay_eye_thumbnail(frame, eye_crop, eye_points, quality_result, fused_estimate, x, y, eye_name):
     """Resizes an eye crop and pastes it into the frame at (x, y)."""
     if eye_crop is None or eye_crop.size == 0:
         return
@@ -62,14 +63,6 @@ def overlay_eye_thumbnail(frame, eye_crop, eye_points, quality_result, x, y, eye
         for px, py in eye_points:
             cv2.circle(thumb, (int(px * scale_x), int(py * scale_y)), 2, (0, 255, 0), -1)
 
-    # Show the model's complete decision, not only the usable probability,
-    # using a translucent label band so the eye image stays visible underneath.
-    label_overlay = thumb.copy()
-    cv2.rectangle(label_overlay, (0, 0), (EYE_THUMB_WIDTH, 65), (0, 0, 0), -1)
-    thumb = cv2.addWeighted(label_overlay, 0.45, thumb, 0.55, 0)
-    frame[y:y + EYE_THUMB_HEIGHT, x:x + EYE_THUMB_WIDTH] = thumb
-    cv2.rectangle(frame, (x, y), (x + EYE_THUMB_WIDTH, y + EYE_THUMB_HEIGHT), (0, 255, 0), 1)
-
     if quality_result is None:
         lines = [f"{eye_name}: model off"]
         color = (0, 165, 255)
@@ -82,6 +75,18 @@ def overlay_eye_thumbnail(frame, eye_crop, eye_points, quality_result, x, y, eye
             f"occ {occluded:.0%}  sun {sunglasses:.0%}",
         ]
         color = (0, 255, 0) if quality_result.usable_probability >= 0.85 else (0, 165, 255)
+
+        if fused_estimate is not None and fused_estimate.inferred_from_other_eye:
+            lines.append(f"inferred open {fused_estimate.open_probability:.0%} (from other eye)")
+
+    # Show the model's complete decision, not only the usable probability,
+    # using a translucent label band so the eye image stays visible underneath.
+    label_band_height = min(18 + len(lines) * 20, EYE_THUMB_HEIGHT)
+    label_overlay = thumb.copy()
+    cv2.rectangle(label_overlay, (0, 0), (EYE_THUMB_WIDTH, label_band_height), (0, 0, 0), -1)
+    thumb = cv2.addWeighted(label_overlay, 0.45, thumb, 0.55, 0)
+    frame[y:y + EYE_THUMB_HEIGHT, x:x + EYE_THUMB_WIDTH] = thumb
+    cv2.rectangle(frame, (x, y), (x + EYE_THUMB_WIDTH, y + EYE_THUMB_HEIGHT), (0, 255, 0), 1)
 
     for index, line in enumerate(lines):
         cv2.putText(
@@ -110,12 +115,16 @@ def draw_eye_thumbnails(
     right_thumb_x = frame_width - EYE_THUMB_MARGIN - EYE_THUMB_WIDTH
     left_thumb_x = right_thumb_x - EYE_THUMB_MARGIN - EYE_THUMB_WIDTH
 
+    # Borrow the other eye's open/closed distribution when one eye is occluded.
+    left_eye_fused, right_eye_fused = fuse_eye_pair(left_eye_quality, right_eye_quality)
+
     # Swapped so the displayed order matches the mirrored (flipped) frame.
     overlay_eye_thumbnail(
         frame,
         right_eye_crop,
         right_eye_points,
         right_eye_quality,
+        right_eye_fused,
         left_thumb_x,
         EYE_THUMB_MARGIN,
         "R",
@@ -125,6 +134,7 @@ def draw_eye_thumbnails(
         left_eye_crop,
         left_eye_points,
         left_eye_quality,
+        left_eye_fused,
         right_thumb_x,
         EYE_THUMB_MARGIN,
         "L",

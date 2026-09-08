@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -38,8 +39,28 @@ RIGHT_KEYS = {
     ord("p"): "sunglasses",
 }
 
+MANIFEST_COLUMNS = ("frame_id", "eye", "class", "path")
 
-def save_patch(output_directory: Path, class_name: str, eye_name: str, patch) -> Path | None:
+
+def append_manifest_row(output_directory: Path, frame_id: int, eye_name: str, class_name: str, path: Path) -> None:
+    """Records which camera frame a saved patch came from.
+
+    Patches saved with the same frame_id came from the exact same instant
+    (guaranteed when saved while frozen -- see the 'Z' key in `collect()`),
+    which lets estimate_pair_correlation.py later match them into genuine
+    left/right ground-truth pairs, including asymmetric ones.
+    """
+    manifest_path = output_directory / "pairs_manifest.csv"
+    is_new_file = not manifest_path.exists()
+
+    with manifest_path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=MANIFEST_COLUMNS)
+        if is_new_file:
+            writer.writeheader()
+        writer.writerow({"frame_id": frame_id, "eye": eye_name, "class": class_name, "path": str(path)})
+
+
+def save_patch(output_directory: Path, class_name: str, eye_name: str, patch, frame_id: int) -> Path | None:
     """Saves one patch and returns its path, or None if the crop is unavailable."""
     if patch is None or patch.size == 0:
         return None
@@ -47,18 +68,19 @@ def save_patch(output_directory: Path, class_name: str, eye_name: str, patch) ->
     class_directory = output_directory / class_name
     class_directory.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    output_path = class_directory / f"{timestamp}_{eye_name}.jpg"
+    output_path = class_directory / f"{frame_id:08d}_{timestamp}_{eye_name}.jpg"
 
     if not cv2.imwrite(str(output_path), patch):
         raise RuntimeError(f"Could not save patch: {output_path}")
 
+    append_manifest_row(output_directory, frame_id, eye_name, class_name, output_path)
     return output_path
 
 
 def annotate_frame(frame):
     """Draws short, always-visible data-collection controls."""
     instructions = (
-        "1-4: save both | A/S/D/F: left | J/K/L/P: right | Q: quit",
+        "1-4: save both | A/S/D/F: left | J/K/L/P: right | Z: freeze pair | Q: quit",
         "1/A/J open  2/S/K closed  3/D/L occluded  4/F/P sunglasses",
     )
     for index, line in enumerate(instructions):
@@ -79,53 +101,80 @@ def collect(camera_index: int, output_directory: Path) -> None:
     output_directory.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] Saving labelled patches in: {output_directory.resolve()}")
     print("[INFO] Use the visible keyboard controls; press Q to finish.")
+    print(
+        "[INFO] Press Z to freeze the current frame, then label each eye "
+        "independently (e.g. one closed, one open) to record a true paired "
+        "example for estimating cross-eye correlation. Press Z again to resume."
+    )
 
     latest_left_patch = None
     latest_right_patch = None
+    base_frame = None
+    frozen = False
+    frame_id = 0
 
     try:
         while True:
-            success, frame = camera.read()
-            if not success:
-                print("[WARNING] Could not read a camera frame.")
-                break
+            if not frozen:
+                success, frame = camera.read()
+                if not success:
+                    print("[WARNING] Could not read a camera frame.")
+                    break
 
-            frame = cv2.flip(frame, 1)
-            results = detector.find_face_landmarks(frame)
+                frame = cv2.flip(frame, 1)
+                results = detector.find_face_landmarks(frame)
 
-            if results.multi_face_landmarks:
-                landmarks = results.multi_face_landmarks[0].landmark
-                latest_left_patch, _ = crop_eye_region(frame, landmarks, LEFT_EYE_INDICES)
-                latest_right_patch, _ = crop_eye_region(frame, landmarks, RIGHT_EYE_INDICES)
-                detector.draw_mesh(frame, results)
-                cv2.putText(frame, "Face detected", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2, cv2.LINE_AA)
-            else:
-                latest_left_patch = None
-                latest_right_patch = None
-                cv2.putText(frame, "Face not detected", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA)
+                if results.multi_face_landmarks:
+                    landmarks = results.multi_face_landmarks[0].landmark
+                    latest_left_patch, _ = crop_eye_region(frame, landmarks, LEFT_EYE_INDICES)
+                    latest_right_patch, _ = crop_eye_region(frame, landmarks, RIGHT_EYE_INDICES)
+                    detector.draw_mesh(frame, results)
+                    cv2.putText(frame, "Face detected", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2, cv2.LINE_AA)
+                else:
+                    latest_left_patch = None
+                    latest_right_patch = None
+                    cv2.putText(frame, "Face not detected", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2, cv2.LINE_AA)
 
-            annotate_frame(frame)
-            cv2.imshow("Eye Quality Patch Collection", frame)
+                base_frame = frame
+                frame_id += 1
+
+            display_frame = base_frame.copy()
+            annotate_frame(display_frame)
+            if frozen:
+                cv2.putText(
+                    display_frame,
+                    "FROZEN -- label each eye, then press Z to resume",
+                    (10, 135),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+            cv2.imshow("Eye Quality Patch Collection", display_frame)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
 
-            if key in PAIR_KEYS:
+            if key == ord("z"):
+                frozen = not frozen
+                print("[INFO] Frame frozen for paired labeling." if frozen else "[INFO] Resumed live feed.")
+            elif key in PAIR_KEYS:
                 class_name = PAIR_KEYS[key]
                 saved = [
-                    save_patch(output_directory, class_name, "left", latest_left_patch),
-                    save_patch(output_directory, class_name, "right", latest_right_patch),
+                    save_patch(output_directory, class_name, "left", latest_left_patch, frame_id),
+                    save_patch(output_directory, class_name, "right", latest_right_patch, frame_id),
                 ]
                 count = sum(path is not None for path in saved)
                 print(f"[SAVED] {count} eye patches as {class_name}.")
             elif key in LEFT_KEYS:
                 class_name = LEFT_KEYS[key]
-                saved = save_patch(output_directory, class_name, "left", latest_left_patch)
+                saved = save_patch(output_directory, class_name, "left", latest_left_patch, frame_id)
                 print(f"[SAVED] Left eye as {class_name}." if saved else "[WARNING] No left-eye patch to save.")
             elif key in RIGHT_KEYS:
                 class_name = RIGHT_KEYS[key]
-                saved = save_patch(output_directory, class_name, "right", latest_right_patch)
+                saved = save_patch(output_directory, class_name, "right", latest_right_patch, frame_id)
                 print(f"[SAVED] Right eye as {class_name}." if saved else "[WARNING] No right-eye patch to save.")
     finally:
         camera.release()
