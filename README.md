@@ -36,9 +36,17 @@ Run these commands from the project root in PowerShell.
 
 ### Live camera application
 
+Create this environment once with `uv`:
+
+```powershell
+uv venv .venv --python 3.12
+uv pip install --python .venv\Scripts\python.exe -r requirements.txt
+```
+
+Activate it to run the live stream:
+
 ```powershell
 .\.venv\Scripts\Activate.ps1
-pip install onnxruntime  # one-time, only needed for the eye-quality model
 python src\camera_stream.py
 ```
 
