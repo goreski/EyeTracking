@@ -151,6 +151,14 @@ class DriverStateMonitor:
 
         return False
 
+    def is_horizontal_neutral(self, horizontal_deviation) -> bool:
+        """True when this frame's sideways reading is within the attentive range."""
+        return abs(horizontal_deviation) <= self.sideways_threshold
+
+    def is_vertical_neutral(self, vertical_deviation) -> bool:
+        """True when this frame's up/down reading is within the attentive range."""
+        return self.upward_threshold <= vertical_deviation <= self.downward_threshold
+
     def classify_head_direction(self, horizontal_deviation, vertical_deviation):
         """Produces the raw head-direction observation for one frame.
 

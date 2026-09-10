@@ -282,6 +282,18 @@ def process_driver_frame(frame):
             avg_ear=avg_ear,
         )
 
+        # Slowly self-correct baseline drift (e.g. after a large head
+        # movement) whenever this frame's own reading is near-neutral,
+        # instead of requiring a manual recalibration every time "looking
+        # straight" stops matching the original baseline. Each axis is
+        # gated independently -- see the docstring on adapt_baseline for why
+        # a single combined gate can get an axis permanently stuck.
+        calibrator.adapt_baseline(
+            raw_features,
+            horizontal_neutral=state_monitor.is_horizontal_neutral(horizontal_deviation),
+            vertical_neutral=state_monitor.is_vertical_neutral(vertical_deviation),
+        )
+
         # Render status onto the live video feed, below the eye thumbnails
         cv2.putText(
             frame,
