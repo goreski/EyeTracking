@@ -112,3 +112,22 @@ def fuse_eye_pair(
     this eye is occluded and the other eye is not.
     """
     return _fuse_one_eye(left, right), _fuse_one_eye(right, left)
+
+
+def eyes_closed_probability(
+    left_fused: FusedEyeEstimate | None, right_fused: FusedEyeEstimate | None
+) -> float | None:
+    """Averages both eyes' closed-probability into one drowsiness signal.
+
+    Returns None when neither eye has an estimate (model unavailable, or no
+    eye crop this frame) so callers can fall back to a non-ML signal instead
+    of silently treating "unknown" as "eyes open".
+    """
+    open_probabilities = [
+        estimate.open_probability for estimate in (left_fused, right_fused) if estimate is not None
+    ]
+
+    if not open_probabilities:
+        return None
+
+    return 1.0 - (sum(open_probabilities) / len(open_probabilities))

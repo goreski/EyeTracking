@@ -17,7 +17,7 @@ from detector import (
     RIGHT_EYE_INDICES,
 )
 from models.eye_quality import EyeQualityModel
-from eye_pair_fusion import fuse_eye_pair
+from eye_pair_fusion import eyes_closed_probability, fuse_eye_pair
 from state_monitor import DriverStateMonitor
 
 from metrics import (
@@ -31,7 +31,11 @@ from metrics import (
 # Initialize global tools
 detector = DriverFaceDetector()
 calibrator = GazeCalibrator()
-state_monitor = DriverStateMonitor()
+# Looser than the class defaults (sideways 0.08, downward -0.05): the
+# "Attentive" cone was too narrow, tripping "Distracted" on ordinary small
+# head movement. Raise further if still too sensitive, or tighten back down
+# if real distraction stops registering.
+state_monitor = DriverStateMonitor(sideways_threshold=0.20, downward_threshold=-0.09)
 eye_quality_model = EyeQualityModel.from_environment()
 
 # Calibration configuration
@@ -106,17 +110,16 @@ def draw_eye_thumbnails(
     left_eye_crop,
     left_eye_points,
     left_eye_quality,
+    left_eye_fused,
     right_eye_crop,
     right_eye_points,
     right_eye_quality,
+    right_eye_fused,
 ):
     # Anchored to the top-right corner of the frame.
     frame_width = frame.shape[1]
     right_thumb_x = frame_width - EYE_THUMB_MARGIN - EYE_THUMB_WIDTH
     left_thumb_x = right_thumb_x - EYE_THUMB_MARGIN - EYE_THUMB_WIDTH
-
-    # Borrow the other eye's open/closed distribution when one eye is occluded.
-    left_eye_fused, right_eye_fused = fuse_eye_pair(left_eye_quality, right_eye_quality)
 
     # Swapped so the displayed order matches the mirrored (flipped) frame.
     overlay_eye_thumbnail(
@@ -196,6 +199,11 @@ def process_driver_frame(frame):
     left_eye_quality = eye_quality_model.predict(left_eye_crop)
     right_eye_quality = eye_quality_model.predict(right_eye_crop)
 
+    # Borrow the other eye's open/closed distribution when one eye is occluded,
+    # then combine both eyes into one drowsiness signal for the state machine.
+    left_eye_fused, right_eye_fused = fuse_eye_pair(left_eye_quality, right_eye_quality)
+    closed_probability = eyes_closed_probability(left_eye_fused, right_eye_fused)
+
     frame = detector.draw_mesh(frame, detection_results)
 
     # 2. Extract raw landmark feature coordinates
@@ -217,9 +225,11 @@ def process_driver_frame(frame):
             left_eye_crop,
             left_eye_points,
             left_eye_quality,
+            left_eye_fused,
             right_eye_crop,
             right_eye_points,
             right_eye_quality,
+            right_eye_fused,
         )
         return frame
 
@@ -254,53 +264,68 @@ def process_driver_frame(frame):
         # Vertical-vector Y changes as the head tilts up or down.
         vertical_deviation = normalized_features[VERTICAL_Y_INDEX]
 
-        # Quick baseline classification rule to test that normalized values work:
+        # Head direction and eye state are independent signals -- a driver
+        # can be looking sideways with eyes open, looking forward with eyes
+        # closed, or any other combination -- so they're tracked and
+        # displayed separately instead of being collapsed into one label.
         state_result = state_monitor.update(
-            avg_ear=avg_ear,
             horizontal_deviation=horizontal_deviation,
             vertical_deviation=vertical_deviation,
+            eyes_closed_probability=closed_probability,
+            avg_ear=avg_ear,
         )
-
-        state = state_result.state
-        color = state_result.color
 
         # Render status onto the live video feed, below the eye thumbnails
         cv2.putText(
             frame,
-            f"STATE: {state}",
+            f"HEAD: {state_result.head_state}",
             (10, 130),
             cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            color,
+            0.85,
+            state_result.head_color,
             2,
             cv2.LINE_AA,
         )
-        
+
+        cv2.putText(
+            frame,
+            f"EYES: {state_result.eye_state}",
+            (10, 160),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.85,
+            state_result.eye_color,
+            2,
+            cv2.LINE_AA,
+        )
+
         cv2.putText(
             frame,
             (
-                f"Observed: {state_monitor.current_observation} "
-                f"({state_result.duration:.1f}s)"
+                f"Observed head: {state_monitor.head_observation} ({state_result.head_duration:.1f}s) | "
+                f"eyes: {state_monitor.eye_observation} ({state_result.eye_duration:.1f}s)"
             ),
-            (10, 200),
+            (10, 190),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
+            0.45,
             (255, 255, 255),
             1,
             cv2.LINE_AA,
         )
-        
+
         # Display debug values to see the normalization in real time
+        closed_probability_text = (
+            f"{closed_probability:.0%}" if closed_probability is not None else "n/a (EAR fallback)"
+        )
         cv2.putText(
             frame,
             (
-                f"EAR: {avg_ear:.2f} | "
+                f"EAR: {avg_ear:.2f} | ClosedP: {closed_probability_text} | "
                 f"Horizontal: {horizontal_deviation:.3f} | "
                 f"Vertical: {vertical_deviation:.3f}"
             ),
-            (10, 170),
+            (10, 215),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
+            0.45,
             (255, 255, 255),
             1,
             cv2.LINE_AA,
@@ -311,9 +336,11 @@ def process_driver_frame(frame):
         left_eye_crop,
         left_eye_points,
         left_eye_quality,
+        left_eye_fused,
         right_eye_crop,
         right_eye_points,
         right_eye_quality,
+        right_eye_fused,
     )
     return frame
 
