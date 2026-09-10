@@ -82,15 +82,20 @@ class DriverStateMonitor:
     def __init__(
         self,
         sideways_threshold=0.08,
-        downward_threshold=-0.05,
+        downward_threshold=0.12,
+        upward_threshold=-0.12,
         eyes_closed_probability_threshold=0.5,
         eye_closed_threshold=0.20,
         sideways_duration=1.5,
         downward_duration=1.5,
+        upward_duration=1.5,
         eyes_closed_duration=1.2,
     ):
         self.sideways_threshold = sideways_threshold
+        # vertical_deviation is read from FORWARD_Y_INDEX (see metrics.py):
+        # positive = looking down, negative = looking up.
         self.downward_threshold = downward_threshold
+        self.upward_threshold = upward_threshold
         self.eyes_closed_probability_threshold = eyes_closed_probability_threshold
         # Geometric EAR fallback, used only when no ML probability is available
         # (eye-quality model off, or no eye crop this frame).
@@ -100,6 +105,7 @@ class DriverStateMonitor:
             required_durations={
                 "Distracted (Looking Sideways)": sideways_duration,
                 "Distracted (Looking Down)": downward_duration,
+                "Distracted (Looking Up)": upward_duration,
                 "Attentive": 0.0,
             },
             default_state="Attentive",
@@ -146,12 +152,19 @@ class DriverStateMonitor:
         return False
 
     def classify_head_direction(self, horizontal_deviation, vertical_deviation):
-        """Produces the raw head-direction observation for one frame."""
+        """Produces the raw head-direction observation for one frame.
+
+        vertical_deviation is positive when looking down, negative when
+        looking up (see FORWARD_Y_INDEX in metrics.py).
+        """
         if abs(horizontal_deviation) > self.sideways_threshold:
             return "Distracted (Looking Sideways)"
 
-        if vertical_deviation < self.downward_threshold:
+        if vertical_deviation > self.downward_threshold:
             return "Distracted (Looking Down)"
+
+        if vertical_deviation < self.upward_threshold:
+            return "Distracted (Looking Up)"
 
         return "Attentive"
 

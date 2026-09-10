@@ -8,6 +8,12 @@ VERTICAL_Y_INDEX = 2
 VERTICAL_Z_INDEX = 3
 
 FORWARD_X_INDEX = 4
+# Pitch (looking up/down) should be read from FORWARD_Y_INDEX, not
+# VERTICAL_Y_INDEX. The forehead-chin vector's Y-component is cos(pitch)
+# shaped: nearly flat near zero and identical in sign for up vs. down, so it
+# can't distinguish looking up from looking down. The nose-tip vector's
+# Y-component is sin(pitch) shaped: linear near zero and correctly signed
+# (positive = down, negative = up).
 FORWARD_Y_INDEX = 5
 FORWARD_Z_INDEX = 6
 

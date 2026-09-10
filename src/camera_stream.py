@@ -24,18 +24,21 @@ from metrics import (
     extract_raw_features,
     GazeCalibrator,
     EAR_INDEX,
-    VERTICAL_Y_INDEX,
     FORWARD_X_INDEX,
+    FORWARD_Y_INDEX,
 )
 
 # Initialize global tools
 detector = DriverFaceDetector()
 calibrator = GazeCalibrator()
-# Looser than the class defaults (sideways 0.08, downward -0.05): the
-# "Attentive" cone was too narrow, tripping "Distracted" on ordinary small
-# head movement. Raise further if still too sensitive, or tighten back down
-# if real distraction stops registering.
-state_monitor = DriverStateMonitor(sideways_threshold=0.20, downward_threshold=-0.09)
+# sideways_threshold widened from the class default (0.08) -- small, ordinary
+# head movement was tripping "Distracted (Looking Sideways)" too easily.
+# downward_threshold/upward_threshold use the pitch signal (see
+# FORWARD_Y_INDEX in metrics.py): positive = looking down, negative = looking
+# up. upward_threshold widened to -0.32 (~19 degrees) -- both -0.12 (~7
+# degrees) and -0.20 (~12 degrees) still triggered "Looking Up" too easily.
+# Tune from the live "Vertical:" debug readout if still off.
+state_monitor = DriverStateMonitor(sideways_threshold=0.20, downward_threshold=0.12, upward_threshold=-0.32)
 eye_quality_model = EyeQualityModel.from_environment()
 
 # Calibration configuration
@@ -261,8 +264,12 @@ def process_driver_frame(frame):
         # Forward-vector X changes as the nose moves left or right.
         horizontal_deviation = normalized_features[FORWARD_X_INDEX]
 
-        # Vertical-vector Y changes as the head tilts up or down.
-        vertical_deviation = normalized_features[VERTICAL_Y_INDEX]
+        # Forward-vector Y changes as the head tilts up (negative) or down
+        # (positive). This is far more sensitive and sign-correct than the
+        # old vertical-vector Y, which was nearly flat near center and
+        # couldn't tell up from down -- see the comment on FORWARD_Y_INDEX
+        # in metrics.py.
+        vertical_deviation = normalized_features[FORWARD_Y_INDEX]
 
         # Head direction and eye state are independent signals -- a driver
         # can be looking sideways with eyes open, looking forward with eyes
