@@ -3,6 +3,9 @@ import warnings
 import cv2
 import time
 import numpy as np
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Suppress noisy background warnings
 os.environ["OPENCV_LOG_LEVEL"] = "SILENT"
@@ -19,6 +22,8 @@ from detector import (
 from models.eye_quality import EyeQualityModel
 from eye_pair_fusion import eyes_closed_probability, fuse_eye_pair
 from state_monitor import DriverStateMonitor
+from spherical_gaze import SphericalAttentionEstimator
+from conformal_prediction import ConformalEyePredictor
 
 from metrics import (
     extract_raw_features,
@@ -31,6 +36,8 @@ from metrics import (
 # Initialize global tools
 detector = DriverFaceDetector()
 calibrator = GazeCalibrator()
+spherical_estimator = SphericalAttentionEstimator()
+conformal_predictor = ConformalEyePredictor(alpha=0.05)
 # sideways_threshold widened from the class default (0.08) -- small, ordinary
 # head movement was tripping "Distracted (Looking Sideways)" too easily.
 # downward_threshold/upward_threshold use the pitch signal (see
@@ -52,7 +59,17 @@ EYE_THUMB_MARGIN = 10
 SHOW_EYE_LANDMARKS = False  # Toggle to draw eye-contour landmarks in the thumbnails
 
 
-def overlay_eye_thumbnail(frame, eye_crop, eye_points, quality_result, fused_estimate, x, y, eye_name):
+def overlay_eye_thumbnail(
+    frame,
+    eye_crop,
+    eye_points,
+    quality_result,
+    fused_estimate,
+    x,
+    y,
+    eye_name,
+    conformal_result=None,
+):
     """Resizes an eye crop and pastes it into the frame at (x, y)."""
     if eye_crop is None or eye_crop.size == 0:
         return
@@ -82,6 +99,12 @@ def overlay_eye_thumbnail(frame, eye_crop, eye_points, quality_result, fused_est
             f"occ {occluded:.0%}  sun {sunglasses:.0%}",
         ]
         color = (0, 255, 0) if quality_result.usable_probability >= 0.85 else (0, 165, 255)
+
+        if conformal_result is not None:
+            abbrevs = {"open_visible": "open", "closed": "cls", "occluded": "occ", "sunglasses": "sun"}
+            set_str = "{" + ",".join(abbrevs.get(c, c) for c in conformal_result.prediction_set) + "}"
+            tag = "singl" if conformal_result.is_singleton else ("ambig" if conformal_result.is_ambiguous else "ood")
+            lines.append(f"conf 95%: {set_str} ({tag})")
 
         if fused_estimate is not None and fused_estimate.inferred_from_other_eye:
             lines.append(f"inferred open {fused_estimate.open_probability:.0%} (from other eye)")
@@ -118,6 +141,8 @@ def draw_eye_thumbnails(
     right_eye_points,
     right_eye_quality,
     right_eye_fused,
+    left_conformal=None,
+    right_conformal=None,
 ):
     # Anchored to the top-right corner of the frame.
     frame_width = frame.shape[1]
@@ -134,6 +159,7 @@ def draw_eye_thumbnails(
         left_thumb_x,
         EYE_THUMB_MARGIN,
         "R",
+        conformal_result=right_conformal,
     )
     overlay_eye_thumbnail(
         frame,
@@ -144,6 +170,7 @@ def draw_eye_thumbnails(
         right_thumb_x,
         EYE_THUMB_MARGIN,
         "L",
+        conformal_result=left_conformal,
     )
 
 
@@ -202,9 +229,18 @@ def process_driver_frame(frame):
     left_eye_quality = eye_quality_model.predict(left_eye_crop)
     right_eye_quality = eye_quality_model.predict(right_eye_crop)
 
-    # Borrow the other eye's open/closed distribution when one eye is occluded,
+    # Conformal prediction sets with coverage guarantees
+    left_conformal = conformal_predictor.predict(left_eye_quality)
+    right_conformal = conformal_predictor.predict(right_eye_quality)
+
+    # Borrow the other eye's open/closed distribution when one eye is occluded or ambiguous,
     # then combine both eyes into one drowsiness signal for the state machine.
-    left_eye_fused, right_eye_fused = fuse_eye_pair(left_eye_quality, right_eye_quality)
+    left_eye_fused, right_eye_fused = fuse_eye_pair(
+        left_eye_quality,
+        right_eye_quality,
+        left_conformal=left_conformal,
+        right_conformal=right_conformal,
+    )
     closed_probability = eyes_closed_probability(left_eye_fused, right_eye_fused)
 
     frame = detector.draw_mesh(frame, detection_results)
@@ -233,6 +269,8 @@ def process_driver_frame(frame):
             right_eye_points,
             right_eye_quality,
             right_eye_fused,
+            left_conformal=left_conformal,
+            right_conformal=right_conformal,
         )
         return frame
 
@@ -252,6 +290,9 @@ def process_driver_frame(frame):
         if len(calibration_buffer) >= REQUIRED_CALIBRATION_FRAMES:
             # Trigger the mathematical averaging once we have enough frames
             calibrator.calibrate(calibration_buffer)
+            # Adapt the spherical road center to the driver's forward baseline
+            baseline_forward = calibrator.baseline_features[4:7]
+            spherical_estimator.adapt_road_center(baseline_forward)
             calibration_buffer.clear() # Free memory
             
     else:
@@ -264,12 +305,12 @@ def process_driver_frame(frame):
         # Forward-vector X changes as the nose moves left or right.
         horizontal_deviation = normalized_features[FORWARD_X_INDEX]
 
-        # Forward-vector Y changes as the head tilts up (negative) or down
-        # (positive). This is far more sensitive and sign-correct than the
-        # old vertical-vector Y, which was nearly flat near center and
-        # couldn't tell up from down -- see the comment on FORWARD_Y_INDEX
-        # in metrics.py.
+        # Forward-vector Y changes as the head tilts up (negative) or down (positive).
         vertical_deviation = normalized_features[FORWARD_Y_INDEX]
+
+        # S^2 directional statistics: von Mises-Fisher cockpit Area of Interest attention
+        gaze_vector_s2 = calibrator.get_spherical_gaze_vector(normalized_features)
+        spherical_attention = spherical_estimator.estimate(gaze_vector_s2)
 
         # Head direction and eye state are independent signals -- a driver
         # can be looking sideways with eyes open, looking forward with eyes
@@ -280,6 +321,7 @@ def process_driver_frame(frame):
             vertical_deviation=vertical_deviation,
             eyes_closed_probability=closed_probability,
             avg_ear=avg_ear,
+            spherical_attention=spherical_attention,
         )
 
         # Slowly self-correct baseline drift (e.g. after a large head
@@ -294,13 +336,27 @@ def process_driver_frame(frame):
             vertical_neutral=state_monitor.is_vertical_neutral(vertical_deviation),
         )
 
+        # Render active probabilistic AOI zone
+        if state_result.active_aoi:
+            aoi_color = (0, 255, 0) if state_result.is_safe_aoi else (0, 0, 255)
+            cv2.putText(
+                frame,
+                f"ZONE: {state_result.active_aoi} ({state_result.aoi_probability:.0%})",
+                (10, 105),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                aoi_color,
+                2,
+                cv2.LINE_AA,
+            )
+
         # Render status onto the live video feed, below the eye thumbnails
         cv2.putText(
             frame,
             f"HEAD: {state_result.head_state}",
-            (10, 130),
+            (10, 135),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.85,
+            0.80,
             state_result.head_color,
             2,
             cv2.LINE_AA,
@@ -309,9 +365,9 @@ def process_driver_frame(frame):
         cv2.putText(
             frame,
             f"EYES: {state_result.eye_state}",
-            (10, 160),
+            (10, 165),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.85,
+            0.80,
             state_result.eye_color,
             2,
             cv2.LINE_AA,
@@ -323,7 +379,7 @@ def process_driver_frame(frame):
                 f"Observed head: {state_monitor.head_observation} ({state_result.head_duration:.1f}s) | "
                 f"eyes: {state_monitor.eye_observation} ({state_result.eye_duration:.1f}s)"
             ),
-            (10, 190),
+            (10, 195),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
             (255, 255, 255),
@@ -339,10 +395,10 @@ def process_driver_frame(frame):
             frame,
             (
                 f"EAR: {avg_ear:.2f} | ClosedP: {closed_probability_text} | "
-                f"Horizontal: {horizontal_deviation:.3f} | "
-                f"Vertical: {vertical_deviation:.3f}"
+                f"H: {horizontal_deviation:.3f} | V: {vertical_deviation:.3f} | "
+                f"Entropy: {spherical_attention.entropy:.2f}b"
             ),
-            (10, 215),
+            (10, 220),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
             (255, 255, 255),
@@ -360,14 +416,82 @@ def process_driver_frame(frame):
         right_eye_points,
         right_eye_quality,
         right_eye_fused,
+        left_conformal=left_conformal,
+        right_conformal=right_conformal,
     )
     return frame
 
 
-def start_camera_stream(camera_index=0):
+class BaslerCameraCapture:
+    """Wraps a pypylon Basler camera behind the same read()/release()
+    interface as cv2.VideoCapture, so it drops into start_camera_stream
+    unchanged. Exposure/gain are exposed because the ace2's default
+    auto-exposure settings can come up very dark under NIR/indoor lighting.
+    """
+
+    def __init__(self, exposure_us: "float | None" = 20000.0, gain: "float | None" = 0.0):
+        from pypylon import pylon
+
+        self._pylon = pylon
+        self.camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
+        self.camera.Open()
+
+        if exposure_us is None:
+            self.camera.ExposureAuto.SetValue("Continuous")
+        else:
+            self.camera.ExposureAuto.SetValue("Off")
+            self.camera.ExposureTime.SetValue(exposure_us)
+
+        if gain is None:
+            self.camera.GainAuto.SetValue("Continuous")
+        else:
+            self.camera.GainAuto.SetValue("Off")
+            self.camera.Gain.SetValue(gain)
+
+        # Mono8 sensor output -> BGR8 so it matches what the rest of the
+        # pipeline (mediapipe, cv2 drawing) expects.
+        self.converter = pylon.ImageFormatConverter()
+        self.converter.OutputPixelFormat = pylon.PixelType_BGR8packed
+        self.converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
+
+        self.camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+
+    def isOpened(self):
+        return self.camera.IsGrabbing()
+
+    def read(self) -> "tuple[bool, np.ndarray]":
+        grab_result = self.camera.RetrieveResult(5000, self._pylon.TimeoutHandling_ThrowException)
+        try:
+            if grab_result.GrabSucceeded():
+                return True, self.converter.Convert(grab_result).GetArray()
+            return False, np.empty((0, 0, 3), dtype=np.uint8)
+        finally:
+            grab_result.Release()
+
+    def release(self):
+        self.camera.StopGrabbing()
+        self.camera.Close()
+
+
+def _parse_auto_float(value: str) -> "float | None":
+    return None if value.strip().lower() == "auto" else float(value)
+
+
+def _open_capture(camera_index):
+    if os.getenv("USE_BASLER_CAMERA", "").lower() in ("1", "true", "yes"):
+        exposure_us = _parse_auto_float(os.getenv("BASLER_EXPOSURE_US", "20000"))
+        gain = _parse_auto_float(os.getenv("BASLER_GAIN", "0"))
+        print(f"[INFO] Opening Basler camera (exposure={exposure_us or 'auto'}us, gain={gain or 'auto'}dB).")
+        return BaslerCameraCapture(exposure_us=exposure_us, gain=gain)
+
     cap = cv2.VideoCapture(camera_index)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    return cap
+
+
+def start_camera_stream(camera_index=0):
+    cap = _open_capture(camera_index)
 
     if not cap.isOpened():
         print(f"[ERROR] Could not open video stream on camera index {camera_index}")

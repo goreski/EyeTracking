@@ -84,6 +84,19 @@ class GazeCalibrator:
 
         return deltas
 
+    def get_spherical_gaze_vector(self, relative_features) -> np.ndarray:
+        """
+        Constructs a normalized 3D unit vector on S^2 from relative forward deviations.
+        Aligned so that (0, 0, 1) corresponds to the neutral calibrated windshield baseline.
+        """
+        dx = float(relative_features[FORWARD_X_INDEX])
+        dy = float(relative_features[FORWARD_Y_INDEX])
+        dz_sq = max(1e-4, 1.0 - (dx * dx + dy * dy))
+        dz = float(np.sqrt(dz_sq))
+        vector = np.array([dx, dy, dz], dtype=np.float64)
+        norm = np.linalg.norm(vector)
+        return vector / (norm if norm > 1e-6 else 1.0)
+
     def adapt_baseline(self, raw_features, horizontal_neutral: bool, vertical_neutral: bool) -> None:
         """Nudges the baseline toward the current reading, correcting slow
         drift between the original calibration and later "looking straight"

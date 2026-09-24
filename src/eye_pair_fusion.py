@@ -81,12 +81,28 @@ def _open_closed_distribution(result: EyeQualityResult | None) -> tuple[float, f
 
 
 def _fuse_one_eye(
-    this_eye: EyeQualityResult | None, other_eye: EyeQualityResult | None
+    this_eye: EyeQualityResult | None,
+    other_eye: EyeQualityResult | None,
+    this_conformal=None,
+    other_conformal=None,
 ) -> FusedEyeEstimate | None:
     if this_eye is None:
         return None
 
+    # Consider this eye unreliable if:
+    # 1. Occlusion probability exceeds threshold, OR
+    # 2. Conformal set is ambiguous and contains 'occluded' or 'sunglasses', while other eye is a clear singleton
     this_eye_occluded = this_eye.probabilities[OCCLUDED_INDEX] >= OCCLUSION_TRUST_THRESHOLD
+    if (
+        not this_eye_occluded
+        and this_conformal is not None
+        and this_conformal.is_ambiguous
+        and any(cls in this_conformal.prediction_set for cls in ("occluded", "sunglasses"))
+        and other_conformal is not None
+        and other_conformal.is_singleton
+    ):
+        this_eye_occluded = True
+
     other_distribution = _open_closed_distribution(other_eye)
 
     if not this_eye_occluded or other_distribution is None:
@@ -106,12 +122,18 @@ def _fuse_one_eye(
 
 
 def fuse_eye_pair(
-    left: EyeQualityResult | None, right: EyeQualityResult | None
+    left: EyeQualityResult | None,
+    right: EyeQualityResult | None,
+    left_conformal=None,
+    right_conformal=None,
 ) -> tuple[FusedEyeEstimate | None, FusedEyeEstimate | None]:
     """Infers each eye's open-probability, borrowing from the other eye when
-    this eye is occluded and the other eye is not.
+    this eye is occluded/ambiguous and the other eye is not.
     """
-    return _fuse_one_eye(left, right), _fuse_one_eye(right, left)
+    return (
+        _fuse_one_eye(left, right, left_conformal, right_conformal),
+        _fuse_one_eye(right, left, right_conformal, left_conformal),
+    )
 
 
 def eyes_closed_probability(

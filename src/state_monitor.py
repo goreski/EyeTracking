@@ -28,6 +28,10 @@ class DriverStateResult:
     eye_duration: float
     eye_confirmed: bool
 
+    active_aoi: str | None = None
+    aoi_probability: float | None = None
+    is_safe_aoi: bool | None = None
+
 
 class _DebouncedObservation:
     """Tracks one noisy per-frame signal, requiring it to persist for a
@@ -56,7 +60,7 @@ class _DebouncedObservation:
             self.observation_started_at = now
 
         duration = now - self.observation_started_at
-        required_duration = self.required_durations[observation]
+        required_duration = self.required_durations.get(observation, 1.5)
         confirmed = duration >= required_duration
 
         if confirmed:
@@ -159,12 +163,26 @@ class DriverStateMonitor:
         """True when this frame's up/down reading is within the attentive range."""
         return self.upward_threshold <= vertical_deviation <= self.downward_threshold
 
-    def classify_head_direction(self, horizontal_deviation, vertical_deviation):
+    def classify_head_direction(
+        self,
+        horizontal_deviation,
+        vertical_deviation,
+        spherical_attention=None,
+    ):
         """Produces the raw head-direction observation for one frame.
 
-        vertical_deviation is positive when looking down, negative when
-        looking up (see FORWARD_Y_INDEX in metrics.py).
+        If spherical_attention is provided, utilizes the von Mises-Fisher (vMF)
+        cockpit Area of Interest posterior. Otherwise falls back to scalar geometric
+        thresholds.
         """
+        if spherical_attention is not None:
+            if spherical_attention.is_safe:
+                if spherical_attention.active_aoi_category == "mirror":
+                    return f"Checking Mirror ({spherical_attention.active_aoi})"
+                return "Attentive"
+            else:
+                return f"Distracted ({spherical_attention.active_aoi})"
+
         if abs(horizontal_deviation) > self.sideways_threshold:
             return "Distracted (Looking Sideways)"
 
@@ -189,11 +207,14 @@ class DriverStateMonitor:
         vertical_deviation,
         eyes_closed_probability=None,
         avg_ear=None,
+        spherical_attention=None,
     ):
         """
         Updates both temporal tracks and returns their independent results.
         """
-        head_observation = self.classify_head_direction(horizontal_deviation, vertical_deviation)
+        head_observation = self.classify_head_direction(
+            horizontal_deviation, vertical_deviation, spherical_attention
+        )
         eye_observation = self.classify_eye_state(eyes_closed_probability, avg_ear)
 
         head_state, head_duration, head_confirmed = self._head_tracker.update(head_observation)
@@ -208,6 +229,9 @@ class DriverStateMonitor:
             eye_color=self.get_state_color(eye_state),
             eye_duration=eye_duration,
             eye_confirmed=eye_confirmed,
+            active_aoi=spherical_attention.active_aoi if spherical_attention else None,
+            aoi_probability=spherical_attention.active_probability if spherical_attention else None,
+            is_safe_aoi=spherical_attention.is_safe if spherical_attention else None,
         )
 
     def update_face_missing(self):
@@ -236,6 +260,9 @@ class DriverStateMonitor:
     def get_state_color(state):
         if state == "Drowsy / Eyes Closed":
             return 0, 165, 255
+
+        if state.startswith("Checking Mirror"):
+            return 255, 200, 0
 
         if state.startswith("Distracted"):
             return 0, 0, 255
